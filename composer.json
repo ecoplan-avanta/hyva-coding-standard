@@ -1,5 +1,5 @@
 {
-    "name": "hyva-themes/hyva-coding-standard",
+    "name": "ecoplan/hyva-coding-standard",
     "description": "A set of Hyvä specific PHP CodeSniffer rules extending the Magento Coding Standard",
     "license": "BSD-3-Clause",
     "require": {
