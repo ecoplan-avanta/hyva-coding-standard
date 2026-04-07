@@ -22,9 +22,9 @@
         <include-pattern>*\.phtml$</include-pattern>
     </rule>
 
-    <rule name="HyvaThemes.Templates.CspRegisterInlineScript">
+    <!-- <rule name="HyvaThemes.Templates.CspRegisterInlineScript">
         <include-pattern>*\.phtml$</include-pattern>
-    </rule>
+    </rule> -->
 
     <rule name="HyvaThemes.Annotation.InheritsMethodAnnotationSniff">
         <include-pattern>*\.php$</include-pattern>
