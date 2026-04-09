@@ -13,6 +13,7 @@
     <arg name="extensions" value="php,phtml,xml"/>
 
     <exclude-pattern>*/node_modules/*</exclude-pattern>
+    <exclude-pattern>*/playwright-report/*</exclude-pattern>
 
     <rule name="HyvaThemes.Templates.BlockEscapeInTemplate">
         <include-pattern>*\.phtml$</include-pattern>
@@ -26,8 +27,13 @@
         <include-pattern>*\.phtml$</include-pattern>
     </rule>
 
-    <rule name="HyvaThemes.Annotation.InheritsMethodAnnotationSniff">
+    <rule name="HyvaThemes.Annotation.InheritsMethodAnnotation">
         <include-pattern>*\.php$</include-pattern>
+    </rule>
+
+    <rule name="HyvaThemes.PHPCompatibility.SetTestVersion">
+        <include-pattern>*\.php$</include-pattern>
+        <include-pattern>*\.phtml$</include-pattern>
     </rule>
 
     <rule ref="Magento2">
