@@ -17,9 +17,7 @@ class CspRegisterInlineScriptSniff implements Sniff
 {
     public const MSG_MISSING_CSP_CALL = 'Missing <?php $hyvaCsp->registerInlineScript(); ?> after </script> tag';
 
-    public const MSG_MISSING_CSP_CALL_WITH_ISSET = 'Missing <?php if (isset($hyvaCsp)) $hyvaCsp->registerInlineScript(); ?> after </script> tag in base area template';
-
-    public const MSG_UNEXPECTED_CSP_CALL = '$hyvaCsp->registerInlineScript() must not be used in adminhtml area templates';
+    public const MSG_MISSING_CSP_CALL_WITH_ISSET = 'Missing <?php if (isset($hyvaCsp)) $hyvaCsp->registerInlineScript(); ?> after </script> tag in base or adminhtml area template';
 
     public const MSG_MISSING_USE_IMPORT = 'Template with <script> tags must have: use Hyva\\Theme\\ViewModel\\HyvaCsp;';
 
@@ -29,11 +27,19 @@ class CspRegisterInlineScriptSniff implements Sniff
     private const AREA_BASE = 'base';
     private const AREA_ADMINHTML = 'adminhtml';
 
+    private const EXECUTABLE_SCRIPT_TYPES = ['text/javascript', 'module', 'speculationrules'];
+
     /** @var array<string, bool> */
     private $checkedFiles = [];
 
     /** @var array<string, string> */
     private $fileAreas = [];
+
+    /** @var array<string, string|false> directory path => theme root path or false */
+    private $themeRootCache = [];
+
+    /** @var array<string, bool> theme root path => is Hyva theme */
+    private $hyvaThemeCache = [];
 
     public function register()
     {
@@ -48,14 +54,28 @@ class CspRegisterInlineScriptSniff implements Sniff
             return;
         }
 
-        $area = $this->detectArea($phpcsFile);
         $filename = $phpcsFile->getFilename();
 
-        if ($area === self::AREA_ADMINHTML) {
-            if (! isset($this->checkedFiles[$filename])) {
-                $this->checkedFiles[$filename] = true;
-                $this->checkAdminhtmlHasNoRegisterCall($phpcsFile);
+        if ($this->isDefaultThemePackage($filename)) {
+            return;
+        }
+
+        $area = $this->detectArea($phpcsFile);
+
+        if ($area === self::AREA_FRONTEND && ! $this->isHyvaTheme($filename)) {
+            return;
+        }
+
+        $scriptInfoList = $this->getScriptInfoList($phpcsFile, $stackPtr, $content);
+        $hasCspRequiringScript = false;
+        foreach ($scriptInfoList as $info) {
+            if ($this->scriptRequiresCsp($info['type'], $info['hasSrc'])) {
+                $hasCspRequiringScript = true;
+                break;
             }
+        }
+
+        if (! $hasCspRequiringScript) {
             return;
         }
 
@@ -65,7 +85,12 @@ class CspRegisterInlineScriptSniff implements Sniff
             $this->checkVarAnnotation($phpcsFile, $stackPtr);
         }
 
-        $this->checkRegisterInlineScriptFollows($phpcsFile, $stackPtr, $content, $area);
+        $this->checkRegisterInlineScriptFollows($phpcsFile, $stackPtr, $content, $area, $scriptInfoList);
+    }
+
+    private function isDefaultThemePackage(string $filename): bool
+    {
+        return strpos($filename, 'hyva-themes/magento2-default-theme/') !== false;
     }
 
     private function detectArea(File $phpcsFile): string
@@ -77,30 +102,104 @@ class CspRegisterInlineScriptSniff implements Sniff
             } elseif (strpos($filename, 'view/base/') !== false) {
                 $this->fileAreas[$filename] = self::AREA_BASE;
             } else {
-                $this->fileAreas[$filename] = self::AREA_FRONTEND;
+                $this->fileAreas[$filename] = $this->detectThemeArea($filename) ?? self::AREA_FRONTEND;
             }
         }
         return $this->fileAreas[$filename];
+    }
+
+    private function detectThemeArea(string $filename): ?string
+    {
+        $themeRoot = $this->findThemeRoot($filename);
+        if ($themeRoot === null) {
+            return null;
+        }
+
+        $registrationFile = $themeRoot . '/registration.php';
+        $content = file_get_contents($registrationFile);
+        if ($content === false) {
+            return null;
+        }
+
+        if (preg_match('/ComponentRegistrar::register\s*\(\s*ComponentRegistrar::THEME\s*,\s*[\'"](\w+)\//s', $content, $matches)) {
+            return $matches[1];
+        }
+
+        return null;
+    }
+
+    private function findThemeRoot(string $filename): ?string
+    {
+        $dir = dirname($filename);
+
+        while ($dir !== dirname($dir)) {
+            if (isset($this->themeRootCache[$dir])) {
+                return $this->themeRootCache[$dir] ?: null;
+            }
+
+            $registrationFile = $dir . '/registration.php';
+            if (file_exists($registrationFile)) {
+                $content = file_get_contents($registrationFile);
+                if ($content !== false) {
+                    if (strpos($content, 'ComponentRegistrar::THEME') !== false) {
+                        $this->themeRootCache[$dir] = $dir;
+                        return $dir;
+                    }
+                    if (strpos($content, 'ComponentRegistrar::MODULE') !== false) {
+                        $this->themeRootCache[$dir] = false;
+                        return null;
+                    }
+                }
+            }
+
+            $dir = dirname($dir);
+        }
+
+        $this->themeRootCache[$dir] = false;
+        return null;
+    }
+
+    private function isHyvaTheme(string $filename): bool
+    {
+        $themeRoot = $this->findThemeRoot($filename);
+        if ($themeRoot === null) {
+            return true; // Not in a theme — assume Hyva (preserve existing behavior for modules)
+        }
+
+        if (! isset($this->hyvaThemeCache[$themeRoot])) {
+            $this->hyvaThemeCache[$themeRoot] = is_dir($themeRoot . '/web/tailwind');
+        }
+
+        return $this->hyvaThemeCache[$themeRoot];
     }
 
     private function checkRegisterInlineScriptFollows(
         File $phpcsFile,
         int $stackPtr,
         string $content,
-        string $area
+        string $area,
+        array $scriptInfoList
     ): void {
         $cspSnippet = $this->getCspSnippet($area);
         $scriptCloseCount = substr_count(strtolower($content), '</script>');
-        $fixIntermediates = false;
-        $fixLast = false;
+        $fixIndices = [];
 
-        // Multiple </script> in one HTML block means at least some are missing CSP calls
-        if ($scriptCloseCount > 1) {
-            for ($i = 0; $i < $scriptCloseCount - 1; $i++) {
+        // Handle intermediate </script> tags (all except the last in this token)
+        for ($i = 0; $i < $scriptCloseCount - 1; $i++) {
+            $info = $scriptInfoList[$i] ?? ['type' => null, 'hasSrc' => false];
+            if ($this->scriptRequiresCsp($info['type'], $info['hasSrc'])) {
                 if ($this->addFixableCspWarning($phpcsFile, $stackPtr, $area)) {
-                    $fixIntermediates = true;
+                    $fixIndices[] = $i;
                 }
             }
+        }
+
+        // Handle the last </script> in the token
+        $lastIndex = $scriptCloseCount - 1;
+        $lastInfo = $scriptInfoList[$lastIndex] ?? ['type' => null, 'hasSrc' => false];
+        if (! $this->scriptRequiresCsp($lastInfo['type'], $lastInfo['hasSrc'])) {
+            $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $fixIndices);
+            return;
         }
 
         // Check content after the last </script> is whitespace-only
@@ -108,9 +207,9 @@ class CspRegisterInlineScriptSniff implements Sniff
         $afterScript = substr($content, $lastPos + 9);
         if (trim($afterScript) !== '') {
             if ($this->addFixableCspWarning($phpcsFile, $stackPtr, $area)) {
-                $fixLast = true;
+                $fixIndices[] = $lastIndex;
             }
-            $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $scriptCloseCount, $fixIntermediates, $fixLast);
+            $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $fixIndices);
             return;
         }
 
@@ -121,9 +220,9 @@ class CspRegisterInlineScriptSniff implements Sniff
         while (isset($tokens[$nextPtr]) && $tokens[$nextPtr]['code'] === T_INLINE_HTML) {
             if (trim($tokens[$nextPtr]['content']) !== '') {
                 if ($this->addFixableCspWarning($phpcsFile, $stackPtr, $area)) {
-                    $fixLast = true;
+                    $fixIndices[] = $lastIndex;
                 }
-                $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $scriptCloseCount, $fixIntermediates, $fixLast);
+                $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $fixIndices);
                 return;
             }
             $nextPtr++;
@@ -131,9 +230,9 @@ class CspRegisterInlineScriptSniff implements Sniff
 
         if (! isset($tokens[$nextPtr]) || $tokens[$nextPtr]['code'] !== T_OPEN_TAG) {
             if ($this->addFixableCspWarning($phpcsFile, $stackPtr, $area)) {
-                $fixLast = true;
+                $fixIndices[] = $lastIndex;
             }
-            $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $scriptCloseCount, $fixIntermediates, $fixLast);
+            $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $fixIndices);
             return;
         }
 
@@ -148,41 +247,39 @@ class CspRegisterInlineScriptSniff implements Sniff
         // Normalize: strip all whitespace for comparison
         $normalizedCode = preg_replace('/\s+/', '', trim($phpCode));
 
-        if ($area === self::AREA_FRONTEND) {
-            $validFrontendCalls = [
-                '$hyvaCsp->registerInlineScript()',
-                '$hyvaCsp->registerInlineScript();',
-            ];
-            if (! in_array($normalizedCode, $validFrontendCalls, true)) {
+        if ($this->requiresIssetGuard($area)) {
+            $hasIssetGuardedCall =
+                strpos($normalizedCode, 'if(isset($hyvaCsp))$hyvaCsp->registerInlineScript()') !== false
+                || strpos($normalizedCode, 'if(isset($hyvaCsp)){$hyvaCsp->registerInlineScript()') !== false;
+            if (! $hasIssetGuardedCall) {
                 $this->addMissingCspWarning($phpcsFile, $stackPtr, $area);
             }
-        } elseif ($area === self::AREA_BASE) {
-            $validBaseCalls = [
-                'if(isset($hyvaCsp))$hyvaCsp->registerInlineScript()',
-                'if(isset($hyvaCsp))$hyvaCsp->registerInlineScript();',
-                'if(isset($hyvaCsp)){$hyvaCsp->registerInlineScript()}',
-                'if(isset($hyvaCsp)){$hyvaCsp->registerInlineScript();}',
-            ];
-            if (! in_array($normalizedCode, $validBaseCalls, true)) {
+        } else {
+            if (strpos($normalizedCode, '$hyvaCsp->registerInlineScript()') === false) {
                 $this->addMissingCspWarning($phpcsFile, $stackPtr, $area);
             }
         }
 
         // Fix intermediate scripts even if last script is correct
-        $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $scriptCloseCount, $fixIntermediates, false);
+        $this->applyCspFix($phpcsFile, $stackPtr, $content, $cspSnippet, $fixIndices);
     }
 
     private function getCspSnippet(string $area): string
     {
-        if ($area === self::AREA_BASE) {
+        if ($this->requiresIssetGuard($area)) {
             return '<?php if (isset($hyvaCsp)) $hyvaCsp->registerInlineScript(); ?>';
         }
         return '<?php $hyvaCsp->registerInlineScript(); ?>';
     }
 
+    private function requiresIssetGuard(string $area): bool
+    {
+        return $area === self::AREA_BASE || $area === self::AREA_ADMINHTML;
+    }
+
     private function addFixableCspWarning(File $phpcsFile, int $stackPtr, string $area): bool
     {
-        if ($area === self::AREA_BASE) {
+        if ($this->requiresIssetGuard($area)) {
             return $phpcsFile->addFixableWarning(self::MSG_MISSING_CSP_CALL_WITH_ISSET, $stackPtr, 'MissingCspRegisterInlineScriptWithIsset');
         }
         return $phpcsFile->addFixableWarning(self::MSG_MISSING_CSP_CALL, $stackPtr, 'MissingCspRegisterInlineScript');
@@ -190,7 +287,7 @@ class CspRegisterInlineScriptSniff implements Sniff
 
     private function addMissingCspWarning(File $phpcsFile, int $stackPtr, string $area): void
     {
-        if ($area === self::AREA_BASE) {
+        if ($this->requiresIssetGuard($area)) {
             $phpcsFile->addWarning(self::MSG_MISSING_CSP_CALL_WITH_ISSET, $stackPtr, 'MissingCspRegisterInlineScriptWithIsset');
         } else {
             $phpcsFile->addWarning(self::MSG_MISSING_CSP_CALL, $stackPtr, 'MissingCspRegisterInlineScript');
@@ -202,26 +299,25 @@ class CspRegisterInlineScriptSniff implements Sniff
         int $stackPtr,
         string $content,
         string $cspSnippet,
-        int $totalScripts,
-        bool $fixIntermediates,
-        bool $fixLast
+        array $fixIndices
     ): void {
-        if (! $fixIntermediates && ! $fixLast) {
+        if (empty($fixIndices)) {
             return;
         }
 
+        $fixSet = array_flip($fixIndices);
+        $totalScripts = substr_count(strtolower($content), '</script>');
         $phpcsFile->fixer->beginChangeset();
 
         $newContent = '';
         $offset = 0;
 
-        for ($i = 1; $i <= $totalScripts; $i++) {
+        for ($i = 0; $i < $totalScripts; $i++) {
             $pos = stripos($content, '</script>', $offset);
             $end = $pos + 9;
             $newContent .= substr($content, $offset, $end - $offset);
 
-            $isLast = ($i === $totalScripts);
-            if ((! $isLast && $fixIntermediates) || ($isLast && $fixLast)) {
+            if (isset($fixSet[$i])) {
                 $newContent .= "\n" . $cspSnippet;
             }
 
@@ -234,14 +330,106 @@ class CspRegisterInlineScriptSniff implements Sniff
         $phpcsFile->fixer->endChangeset();
     }
 
-    private function checkAdminhtmlHasNoRegisterCall(File $phpcsFile): void
+    private function scriptRequiresCsp(?string $type, bool $hasSrc): bool
     {
-        $tokens = $phpcsFile->getTokens();
-        foreach ($tokens as $ptr => $token) {
-            if ($token['code'] === T_STRING && $token['content'] === 'registerInlineScript') {
-                $phpcsFile->addWarning(self::MSG_UNEXPECTED_CSP_CALL, $ptr, 'UnexpectedCspRegisterInlineScript');
+        if ($hasSrc) {
+            return false;
+        }
+        if ($type === null) {
+            return true;
+        }
+        return in_array(strtolower(trim($type)), self::EXECUTABLE_SCRIPT_TYPES, true);
+    }
+
+    private function hasSrcAttribute(string $attributes): bool
+    {
+        return preg_match('/\bsrc\s*=/i', $attributes) === 1;
+    }
+
+    private function extractTypeFromAttributes(string $attributes): ?string
+    {
+        if (preg_match('/\btype\s*=\s*["\']([^"\']*)["\']/', $attributes, $matches)) {
+            return $matches[1];
+        }
+        if (preg_match('/\btype\s*=\s*([^\s>]+)/', $attributes, $matches)) {
+            return $matches[1];
+        }
+        return null;
+    }
+
+    /**
+     * @return array<int, array{type: ?string, hasSrc: bool}> Info for each </script> in the content (0-based index).
+     */
+    private function getScriptInfoList(File $phpcsFile, int $stackPtr, string $content): array
+    {
+        $infoList = [];
+
+        preg_match_all('/<script\b([^>]*)>/i', $content, $openMatches, PREG_OFFSET_CAPTURE);
+        preg_match_all('/<\/script>/i', $content, $closeMatches, PREG_OFFSET_CAPTURE);
+
+        $openCount = count($openMatches[0]);
+        $closeCount = count($closeMatches[0]);
+        $openIndex = 0;
+
+        for ($i = 0; $i < $closeCount; $i++) {
+            $closeOffset = $closeMatches[0][$i][1];
+
+            // Advance past all <script> opens that precede this </script> and use the last one
+            $matchedOpen = null;
+            while ($openIndex < $openCount && $openMatches[0][$openIndex][1] < $closeOffset) {
+                $matchedOpen = $openIndex;
+                $openIndex++;
+            }
+
+            if ($matchedOpen !== null) {
+                $attrs = $openMatches[1][$matchedOpen][0];
+                $infoList[$i] = [
+                    'type' => $this->extractTypeFromAttributes($attrs),
+                    'hasSrc' => $this->hasSrcAttribute($attrs),
+                ];
+            } else {
+                $infoList[$i] = $this->findScriptInfoFromPreviousTokens($phpcsFile, $stackPtr);
             }
         }
+
+        return $infoList;
+    }
+
+    /**
+     * @return array{type: ?string, hasSrc: bool}
+     */
+    private function findScriptInfoFromPreviousTokens(File $phpcsFile, int $stackPtr): array
+    {
+        $tokens = $phpcsFile->getTokens();
+        for ($i = $stackPtr - 1; $i >= 0; $i--) {
+            if ($tokens[$i]['code'] !== T_INLINE_HTML) {
+                continue;
+            }
+            $tokenContent = $tokens[$i]['content'];
+            // Match a complete <script...> tag
+            if (preg_match_all('/<script\b([^>]*)>/i', $tokenContent, $matches)) {
+                $attrs = end($matches[1]);
+                return [
+                    'type' => $this->extractTypeFromAttributes($attrs),
+                    'hasSrc' => $this->hasSrcAttribute($attrs),
+                ];
+            }
+            // Match an incomplete <script tag split across tokens (e.g. PHP in attributes)
+            if (($lastScriptPos = strripos($tokenContent, '<script')) !== false) {
+                $attrs = substr($tokenContent, $lastScriptPos);
+                // Collect subsequent tokens to build complete attribute string
+                for ($j = $i + 1; $j < $stackPtr; $j++) {
+                    if ($tokens[$j]['code'] === T_INLINE_HTML) {
+                        $attrs .= $tokens[$j]['content'];
+                    }
+                }
+                return [
+                    'type' => $this->extractTypeFromAttributes($attrs),
+                    'hasSrc' => $this->hasSrcAttribute($attrs),
+                ];
+            }
+        }
+        return ['type' => null, 'hasSrc' => false];
     }
 
     private function checkUseImport(File $phpcsFile, int $reportPtr): void
@@ -302,26 +490,34 @@ class CspRegisterInlineScriptSniff implements Sniff
     private function checkVarAnnotation(File $phpcsFile, int $reportPtr): void
     {
         $tokens = $phpcsFile->getTokens();
-        $lastVarCommentClose = null;
 
-        foreach ($tokens as $ptr => $token) {
+        // Check if HyvaCsp annotation already exists anywhere in the file
+        foreach ($tokens as $token) {
             if ($token['code'] === T_DOC_COMMENT_STRING && strpos($token['content'], 'HyvaCsp') !== false) {
                 return;
+            }
+        }
+
+        // Find insertion point: last @var in the file header (before first non-whitespace HTML)
+        $lastHeaderVarClose = null;
+        foreach ($tokens as $ptr => $token) {
+            if ($token['code'] === T_INLINE_HTML && trim($token['content']) !== '') {
+                break;
             }
             if ($token['code'] === T_DOC_COMMENT_TAG && $token['content'] === '@var') {
                 $closePtr = $phpcsFile->findNext(T_DOC_COMMENT_CLOSE_TAG, $ptr + 1);
                 if ($closePtr !== false) {
-                    $lastVarCommentClose = $closePtr;
+                    $lastHeaderVarClose = $closePtr;
                 }
             }
         }
 
         if ($phpcsFile->addFixableWarning(self::MSG_MISSING_VAR_ANNOTATION, $reportPtr, 'MissingHyvaCspAnnotation')) {
             $phpcsFile->fixer->beginChangeset();
-            if ($lastVarCommentClose !== null) {
-                $phpcsFile->fixer->addContent($lastVarCommentClose, "\n/** @var HyvaCsp \$hyvaCsp */");
+            if ($lastHeaderVarClose !== null) {
+                $phpcsFile->fixer->addContent($lastHeaderVarClose, "\n/** @var HyvaCsp \$hyvaCsp */");
             } else {
-                // No @var annotations - insert after last use statement
+                // No @var annotations in header - insert after last use statement
                 $lastUseSemicolon = $this->findLastUseSemicolon($phpcsFile);
                 if ($lastUseSemicolon !== null) {
                     $phpcsFile->fixer->addContent($lastUseSemicolon, "\n\n/** @var HyvaCsp \$hyvaCsp */");
@@ -349,6 +545,19 @@ class CspRegisterInlineScriptSniff implements Sniff
         } elseif (isset($tokens[$ptr + 1]) && $tokens[$ptr + 1]['code'] === T_DOC_COMMENT_OPEN_TAG) {
             $ptr++;
             while (isset($tokens[$ptr + 1]) && $tokens[$ptr]['code'] !== T_DOC_COMMENT_CLOSE_TAG) {
+                $ptr++;
+            }
+        }
+
+        // Skip whitespace after comment
+        while (isset($tokens[$ptr + 1]) && $tokens[$ptr + 1]['code'] === T_WHITESPACE) {
+            $ptr++;
+        }
+
+        // Skip declare(strict_types=1); if present
+        if (isset($tokens[$ptr + 1]) && $tokens[$ptr + 1]['code'] === T_DECLARE) {
+            $ptr++;
+            while (isset($tokens[$ptr]) && $tokens[$ptr]['code'] !== T_SEMICOLON) {
                 $ptr++;
             }
         }
